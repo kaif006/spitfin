@@ -1,3 +1,7 @@
 export * from "./constants";
 export * from "./sim";
 export * from "./protocol";
+export * from "./rng";
+export * from "./obstacles";
+export * from "./bugs";
+export * from "./falling";

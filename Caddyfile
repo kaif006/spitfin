@@ -1,0 +1,10 @@
+:80 {
+	handle /ws {
+		reverse_proxy server:8080
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

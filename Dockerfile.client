@@ -1,0 +1,14 @@
+FROM node:22-slim AS build
+RUN corepack enable
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/
+COPY apps/client/package.json apps/client/
+RUN pnpm install --frozen-lockfile --filter @spitfin/client...
+COPY packages/shared packages/shared
+COPY apps/client apps/client
+RUN pnpm --filter @spitfin/client build
+
+FROM caddy:2-alpine
+COPY --from=build /app/apps/client/dist /srv
+COPY Caddyfile /etc/caddy/Caddyfile

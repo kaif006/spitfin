@@ -5,3 +5,4 @@ export * from "./rng";
 export * from "./obstacles";
 export * from "./bugs";
 export * from "./falling";
+export * from "./eating";

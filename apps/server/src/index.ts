@@ -1,30 +1,37 @@
-import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
-import { TICK_HZ, type ClientMsg, type ServerMsg } from "@spitfin/shared";
+import { loadConfig } from "./config";
+import { buildApp } from "./app";
+import { attachWs } from "./ws";
+import { createPool } from "./db/pool";
+import { createRedis } from "./redis";
 
-const port = Number(process.env.PORT ?? 8080);
+const config = loadConfig();
+const pool = createPool(config.databaseUrl);
+const redis = createRedis(config.redisUrl);
 
-const http = createServer((req, res) => {
-  if (req.url === "/healthz") {
-    res.writeHead(200, { "content-type": "text/plain" }).end("ok");
-    return;
-  }
-  res.writeHead(404).end();
+const app = buildApp({
+  logger: config.nodeEnv !== "test",
+  checks: [
+    { name: "postgres", check: async () => { await pool.query("select 1"); } },
+    { name: "redis", check: async () => { await redis.ping(); } },
+  ],
 });
 
-// maxPayload mirrors the 1 KB cap from the security plan.
-const wss = new WebSocketServer({ server: http, path: "/ws", maxPayload: 1024 });
+const wss = attachWs(app.server);
 
-const send = (ws: import("ws").WebSocket, m: ServerMsg) => ws.send(JSON.stringify(m));
+// Same bind as before (all interfaces), needed so the web container can reach us.
+await app.listen({ port: config.port, host: "0.0.0.0" });
 
-wss.on("connection", (ws) => {
-  send(ws, { t: "welcome", tickHz: TICK_HZ });
-  ws.on("message", (data) => {
-    let msg: ClientMsg;
-    try { msg = JSON.parse(data.toString()); } catch { return ws.close(1003); }
-    if (msg?.t === "ping" && Number.isFinite(msg.n)) send(ws, { t: "pong", n: msg.n });
-    else ws.close(1008, "bad message");
-  });
-});
-
-http.listen(port, () => console.log(`[spitfin] listening on :${port}`));
+let stopping = false;
+async function shutdown(signal: string) {
+  if (stopping) return;
+  stopping = true;
+  app.log.info(`${signal} received, shutting down`);
+  // Upgraded sockets are not tracked by the HTTP server, so close them by hand.
+  for (const client of wss.clients) client.terminate();
+  await app.close();
+  await pool.end();
+  redis.disconnect();
+  process.exit(0);
+}
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

@@ -2,6 +2,7 @@ import { loadConfig } from "./config";
 import { buildApp } from "./app";
 import { attachWs } from "./ws";
 import { createPool } from "./db/pool";
+import { readMigrations, runMigrations } from "./db/migrate";
 import { createRedis } from "./redis";
 
 const config = loadConfig();
@@ -17,6 +18,21 @@ const app = buildApp({
 });
 
 const wss = attachWs(app.server);
+
+// Bring the database schema up to date before accepting any traffic.
+// If this fails, exit non-zero so Docker shows the container as failed
+// instead of serving requests against a missing schema.
+try {
+  const applied = await runMigrations(
+    pool,
+    await readMigrations(),
+    (msg) => app.log.info(msg),
+  );
+  app.log.info(`migrations up to date (${applied.length} applied this start)`);
+} catch (err) {
+  app.log.error({ err }, "migration failed");
+  process.exit(1);
+}
 
 // Same bind as before (all interfaces), needed so the web container can reach us.
 await app.listen({ port: config.port, host: "0.0.0.0" });

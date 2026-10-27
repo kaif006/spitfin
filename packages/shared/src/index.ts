@@ -8,3 +8,4 @@ export * from "./falling";
 export * from "./eating";
 export * from "./spit";
 export * from "./nip";
+export * from "./match";

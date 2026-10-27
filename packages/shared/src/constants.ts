@@ -58,3 +58,6 @@ export const SPIT_PITCH_MIN = 0; // radians
 export const SPIT_PITCH_MAX = 1.3; // radians, about 74 degrees
 export const ROCK_HEIGHT = 0.8; // rocks are low: a jet can pass over them
 export const LAG_REWIND_MAX = 0.15; // seconds of lag compensation allowed
+
+// Fish collision
+export const FISH_RADIUS = 0.35; // fish vs reeds and rocks. Small enough to fit the smallest obstacle gap (OBSTACLE_GAP).

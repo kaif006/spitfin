@@ -7,6 +7,7 @@ import { newNipper, tryNip, updateFacing } from "./nip";
 import type { Nipper } from "./nip";
 import { generateObstacles } from "./obstacles";
 import type { Obstacle } from "./obstacles";
+import { collideFish } from "./collide";
 import { stepFish } from "./sim";
 import { newSpitter, trySpit } from "./spit";
 import type { SpitContext, Spitter } from "./spit";
@@ -131,6 +132,7 @@ export function stepSim(
     const ax = num(inp.ax);
     const az = num(inp.az);
     stepFish(ps[i], ax, az, TICK_DT);
+    collideFish(ps[i], s.obstacles);
     updateFacing(ps[i], ax, az);
   }
 

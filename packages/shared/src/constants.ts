@@ -51,3 +51,10 @@ export const BUG_HIT_POP = 1.0; // small upward kick (u/s) when a jet hits a bug
 export const BUG_FALL_DRIFT = 0.8; // max sideways distance a bug drifts while falling
 export const FLOAT_DRIFT_SPEED = 0.15; // max drift speed of a floating bug (u/s)
 export const FLOAT_EDGE_MARGIN = 0.2; // floating bugs stay this far inside the arena edge
+
+// Spit details
+export const SPIT_ORIGIN_Y = 0.3; // height of the fish's mouth above the water
+export const SPIT_PITCH_MIN = 0; // radians
+export const SPIT_PITCH_MAX = 1.3; // radians, about 74 degrees
+export const ROCK_HEIGHT = 0.8; // rocks are low: a jet can pass over them
+export const LAG_REWIND_MAX = 0.15; // seconds of lag compensation allowed

@@ -15,6 +15,7 @@ const app = buildApp({
     { name: "postgres", check: async () => { await pool.query("select 1"); } },
     { name: "redis", check: async () => { await redis.ping(); } },
   ],
+  auth: { db: pool, redis, cookieSecure: config.cookieSecure },
 });
 
 const wss = attachWs(app.server);

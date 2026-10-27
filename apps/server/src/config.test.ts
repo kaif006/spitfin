@@ -23,6 +23,7 @@ describe("loadConfig", () => {
     expect(c).toEqual({
       nodeEnv: "production", port: 9000,
       databaseUrl: "postgres://d", redisUrl: "redis://r",
+      cookieSecure: true,
     });
   });
 

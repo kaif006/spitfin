@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { registerAuthRoutes, type AuthDeps } from "./routes/auth.js";
 
 export type HealthCheck = { name: string; check: () => Promise<void> };
 
@@ -6,6 +7,7 @@ export type AppOptions = {
   checks?: HealthCheck[];
   logger?: boolean;
   readyTimeoutMs?: number;
+  auth?: AuthDeps;
 };
 
 function withTimeout(p: Promise<void>, ms: number): Promise<void> {
@@ -19,7 +21,7 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
 }
 
 export function buildApp(opts: AppOptions = {}): FastifyInstance {
-  const { checks = [], logger = false, readyTimeoutMs = 2000 } = opts;
+  const { checks = [], logger = false, readyTimeoutMs = 2000, auth } = opts;
 
   // 16 KB body cap: auth requests are tiny JSON, anything bigger is abuse.
   const app = Fastify({ logger, bodyLimit: 16 * 1024 });
@@ -40,6 +42,8 @@ export function buildApp(opts: AppOptions = {}): FastifyInstance {
     const ok = results.every(([, status]) => status === "ok");
     return reply.code(ok ? 200 : 503).send({ ok, checks: Object.fromEntries(results) });
   });
+
+  if (auth) registerAuthRoutes(app, auth);
 
   return app;
 }

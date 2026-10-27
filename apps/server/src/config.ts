@@ -3,10 +3,20 @@ export type Config = {
   port: number;
   databaseUrl: string;
   redisUrl: string;
+  /** Whether the session cookie gets the Secure flag. Needs HTTPS to work in Safari. */
+  cookieSecure: boolean;
 };
 
 const DEV_DATABASE_URL = "postgres://spitfin:dev-only-change-me@localhost:5432/spitfin";
 const DEV_REDIS_URL = "redis://localhost:6379";
+
+function parseBool(name: string, raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  const v = raw.toLowerCase();
+  if (v === "true" || v === "1") return true;
+  if (v === "false" || v === "0") return false;
+  throw new Error(`Invalid ${name}: ${raw}`);
+}
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const nodeEnv =
@@ -23,5 +33,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!databaseUrl) throw new Error("DATABASE_URL is required in production");
   if (!redisUrl) throw new Error("REDIS_URL is required in production");
 
-  return { nodeEnv, port, databaseUrl, redisUrl };
+  const cookieSecure = parseBool("COOKIE_SECURE", env.COOKIE_SECURE, nodeEnv === "production");
+
+  return { nodeEnv, port, databaseUrl, redisUrl, cookieSecure };
 }

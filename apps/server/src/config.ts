@@ -5,6 +5,8 @@ export type Config = {
   redisUrl: string;
   /** Whether the session cookie gets the Secure flag. Needs HTTPS to work in Safari. */
   cookieSecure: boolean;
+  /** Trust X-Forwarded-For from the proxy in front of us. Only safe when only the proxy can reach the server. */
+  trustProxy: boolean;
 };
 
 const DEV_DATABASE_URL = "postgres://spitfin:dev-only-change-me@localhost:5432/spitfin";
@@ -34,6 +36,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!redisUrl) throw new Error("REDIS_URL is required in production");
 
   const cookieSecure = parseBool("COOKIE_SECURE", env.COOKIE_SECURE, nodeEnv === "production");
+  // Off by default everywhere: turning it on is a deliberate statement about the network layout.
+  const trustProxy = parseBool("TRUST_PROXY", env.TRUST_PROXY, false);
 
-  return { nodeEnv, port, databaseUrl, redisUrl, cookieSecure };
+  return { nodeEnv, port, databaseUrl, redisUrl, cookieSecure, trustProxy };
 }

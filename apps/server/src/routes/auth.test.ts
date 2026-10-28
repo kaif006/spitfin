@@ -6,6 +6,7 @@ import { CSRF_HEADER, csrfTokenFor } from "../security/csrf.js";
 import { hashPassword } from "../security/password.js";
 import { SESSION_MAX_AGE_S } from "../security/session.js";
 import { consumeTicket } from "../security/ticket.js";
+import { fakeRedis } from "../test-support/fakeRedis.js";
 
 vi.mock("../db/users.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../db/users.js")>();
@@ -40,23 +41,6 @@ beforeEach(() => {
   vi.mocked(users.findUserById).mockResolvedValue(ADA);
 });
 
-function fakeRedis() {
-  const data = new Map<string, string>();
-  return {
-    set: async (key: string, value: string, _mode: "EX", _seconds: number) => {
-      data.set(key, value);
-      return "OK";
-    },
-    get: async (key: string) => data.get(key) ?? null,
-    del: async (key: string) => (data.delete(key) ? 1 : 0),
-    expire: async (_key: string, _seconds: number) => 1,
-    getdel: async (key: string) => {
-      const value = data.get(key) ?? null;
-      data.delete(key);
-      return value;
-    },
-  };
-}
 
 type App = ReturnType<typeof buildApp>;
 
@@ -391,5 +375,106 @@ describe("request checks", () => {
     const app = buildApp();
     const res = await app.inject({ method: "GET", url: "/api/auth/me" });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+describe("rate limits", () => {
+  const wrongLogin = (app: App, email = EMAIL) =>
+    post(app, "/api/auth/login", { body: { email, password: "not the password" } });
+
+  beforeEach(() => {
+    vi.mocked(users.findUserByEmail).mockResolvedValue({ ...ADA, pwHash: adaHash });
+  });
+
+  it("locks an account after 5 wrong passwords, even for the right password", async () => {
+    const { app } = setup();
+    for (let i = 0; i < 5; i++) expect((await wrongLogin(app)).statusCode).toBe(401);
+    const callsBefore = vi.mocked(users.findUserByEmail).mock.calls.length;
+    const res = await post(app, "/api/auth/login", { body: { email: EMAIL, password: PASSWORD } });
+    expect(res.statusCode).toBe(429);
+    expect(res.json()).toEqual({ error: "rate_limited", retryAfterS: 30 });
+    expect(res.headers["retry-after"]).toBe("30");
+    expect(res.headers["set-cookie"]).toBeUndefined();
+    // Refused before any lookup or hashing.
+    expect(vi.mocked(users.findUserByEmail).mock.calls.length).toBe(callsBefore);
+  });
+
+  it("locks unknown emails the same way, so lockout does not reveal accounts", async () => {
+    const { app } = setup();
+    vi.mocked(users.findUserByEmail).mockResolvedValue(null);
+    for (let i = 0; i < 5; i++) expect((await wrongLogin(app, "nobody@example.com")).statusCode).toBe(401);
+    expect((await wrongLogin(app, "nobody@example.com")).statusCode).toBe(429);
+  });
+
+  it("locks per email, ignoring letter case, and leaves other emails alone", async () => {
+    const { app } = setup();
+    for (let i = 0; i < 5; i++) await wrongLogin(app);
+    expect((await wrongLogin(app, "ADA@Example.com")).statusCode).toBe(429);
+    expect((await wrongLogin(app, "grace@example.com")).statusCode).toBe(401);
+  });
+
+  it("a successful login resets the failure count", async () => {
+    const { app } = setup();
+    for (let i = 0; i < 4; i++) expect((await wrongLogin(app)).statusCode).toBe(401);
+    const ok = await post(app, "/api/auth/login", { body: { email: EMAIL, password: PASSWORD } });
+    expect(ok.statusCode).toBe(200);
+    for (let i = 0; i < 4; i++) expect((await wrongLogin(app)).statusCode).toBe(401);
+  });
+
+  it("limits login attempts per IP, counting bad requests too", async () => {
+    const { app } = setup();
+    for (let i = 0; i < 30; i++) {
+      expect((await post(app, "/api/auth/login", { body: {} })).statusCode).toBe(400);
+    }
+    const res = await post(app, "/api/auth/login", { body: {} });
+    expect(res.statusCode).toBe(429);
+    expect(res.headers["retry-after"]).toBe("900");
+  });
+
+  it("limits registrations to 5 per hour per IP", async () => {
+    const { app } = setup();
+    for (let i = 0; i < 5; i++) {
+      expect((await post(app, "/api/auth/register", { body: {} })).statusCode).toBe(400);
+    }
+    const res = await post(app, "/api/auth/register", { body: {} });
+    expect(res.statusCode).toBe(429);
+    expect(res.headers["retry-after"]).toBe("3600");
+  });
+
+  it("limits guest accounts to 10 per hour per IP", async () => {
+    const { app } = setup();
+    vi.mocked(users.createGuest).mockImplementation(async (_db, displayName) => ({
+      id: "22222222-2222-4222-8222-222222222222",
+      email: null,
+      displayName,
+      isGuest: true,
+      createdAt: new Date(0),
+    }));
+    for (let i = 0; i < 10; i++) expect((await post(app, "/api/auth/guest")).statusCode).toBe(201);
+    expect((await post(app, "/api/auth/guest")).statusCode).toBe(429);
+  });
+
+  it("only believes X-Forwarded-For when trustProxy is on", async () => {
+    const attempt = (app: App, ip: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        headers: { host: HOST, origin: ORIGIN, "x-forwarded-for": ip },
+        payload: {},
+      });
+
+    // Off: a forged header does not give a fresh allowance.
+    const plain = setup().app;
+    for (let i = 0; i < 30; i++) await attempt(plain, "1.1.1.1");
+    expect((await attempt(plain, "2.2.2.2")).statusCode).toBe(429);
+
+    // On: each forwarded address gets its own count.
+    const proxied = buildApp({
+      trustProxy: true,
+      auth: { db: {} as users.Db, redis: fakeRedis(), cookieSecure: false },
+    });
+    for (let i = 0; i < 30; i++) await attempt(proxied, "1.1.1.1");
+    expect((await attempt(proxied, "1.1.1.1")).statusCode).toBe(429);
+    expect((await attempt(proxied, "2.2.2.2")).statusCode).toBe(400);
   });
 });

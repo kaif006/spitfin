@@ -8,6 +8,7 @@ export type AppOptions = {
   logger?: boolean;
   readyTimeoutMs?: number;
   auth?: AuthDeps;
+  trustProxy?: boolean;
 };
 
 function withTimeout(p: Promise<void>, ms: number): Promise<void> {
@@ -21,10 +22,10 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
 }
 
 export function buildApp(opts: AppOptions = {}): FastifyInstance {
-  const { checks = [], logger = false, readyTimeoutMs = 2000, auth } = opts;
+  const { checks = [], logger = false, readyTimeoutMs = 2000, auth, trustProxy = false } = opts;
 
   // 16 KB body cap: auth requests are tiny JSON, anything bigger is abuse.
-  const app = Fastify({ logger, bodyLimit: 16 * 1024 });
+  const app = Fastify({ logger, bodyLimit: 16 * 1024, trustProxy });
 
   app.get("/healthz", async (_req, reply) => reply.type("text/plain").send("ok"));
 

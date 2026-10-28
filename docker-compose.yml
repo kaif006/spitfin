@@ -27,6 +27,7 @@ services:
       DATABASE_URL: postgres://spitfin:dev-only-change-me@postgres:5432/spitfin
       REDIS_URL: redis://redis:6379
       COOKIE_SECURE: "false" # plain http://localhost:8000; set to "true" behind HTTPS
+      TRUST_PROXY: "true" # only Caddy can reach the server, and it sets X-Forwarded-For
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

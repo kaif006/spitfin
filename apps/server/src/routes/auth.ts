@@ -22,6 +22,16 @@ import {
 } from "../security/csrf.js";
 import { hashPassword, verifyPassword } from "../security/password.js";
 import {
+  checkLimit,
+  clearLoginFailures,
+  GUEST_IP,
+  LOGIN_IP,
+  loginLockRemainingMs,
+  recordLoginFailure,
+  REGISTER_IP,
+  type RateStore,
+} from "../security/ratelimit.js";
+import {
   destroySession,
   getSession,
   rotateSession,
@@ -33,13 +43,21 @@ import { parseLogin, parseRegister } from "../security/validation.js";
 
 export type AuthDeps = {
   db: Db;
-  redis: SessionStore & TicketStore;
+  redis: SessionStore & TicketStore & RateStore;
   cookieSecure: boolean;
 };
 
 // What a client may see about a user. Never includes the password hash.
 function publicUser(u: User) {
   return { id: u.id, email: u.email, displayName: u.displayName, isGuest: u.isGuest };
+}
+
+function rateLimited(reply: FastifyReply, retryAfterMs: number) {
+  const retryAfterS = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  return reply
+    .code(429)
+    .header("Retry-After", String(retryAfterS))
+    .send({ error: "rate_limited", retryAfterS });
 }
 
 // Replaces any session the browser sent, then sets the new cookie.
@@ -90,6 +108,9 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
       });
 
       api.post("/register", async (req, reply) => {
+        const limit = await checkLimit(deps.redis, REGISTER_IP, req.ip);
+        if (!limit.allowed) return rateLimited(reply, limit.retryAfterMs);
+
         const parsed = parseRegister(req.body);
         if (!parsed.ok) {
           return reply.code(400).send({ error: "invalid", fields: parsed.errors });
@@ -109,20 +130,35 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
       });
 
       api.post("/login", async (req, reply) => {
+        const limit = await checkLimit(deps.redis, LOGIN_IP, req.ip);
+        if (!limit.allowed) return rateLimited(reply, limit.retryAfterMs);
+
         const parsed = parseLogin(req.body);
         if (!parsed.ok) {
           return reply.code(400).send({ error: "invalid", fields: parsed.errors });
         }
-        const user = await findUserByEmail(deps.db, parsed.value.email);
+        const { email, password } = parsed.value;
+
+        // A locked account is refused before any password work, even for the right password.
+        const lockMs = await loginLockRemainingMs(deps.redis, email);
+        if (lockMs > 0) return rateLimited(reply, lockMs);
+
+        const user = await findUserByEmail(deps.db, email);
         // Unknown emails still pay the hashing cost, so timing does not leak them.
-        const ok = await verifyPassword(user?.pwHash ?? null, parsed.value.password);
+        const ok = await verifyPassword(user?.pwHash ?? null, password);
         if (user === null || !ok) {
+          // Counted for unknown emails too, so lockout does not reveal which accounts exist.
+          await recordLoginFailure(deps.redis, email);
           return reply.code(401).send({ error: "invalid_credentials" });
         }
+        await clearLoginFailures(deps.redis, email);
         return reply.code(200).send(await startSession(deps, req, reply, user));
       });
 
       api.post("/guest", async (req, reply) => {
+        const limit = await checkLimit(deps.redis, GUEST_IP, req.ip);
+        if (!limit.allowed) return rateLimited(reply, limit.retryAfterMs);
+
         const name = `Guest-${String(randomInt(0, 10_000)).padStart(4, "0")}`;
         const user = await createGuest(deps.db, name);
         return reply.code(201).send(await startSession(deps, req, reply, user));

@@ -11,6 +11,7 @@ const redis = createRedis(config.redisUrl);
 
 const app = buildApp({
   logger: config.nodeEnv !== "test",
+  trustProxy: config.trustProxy,
   checks: [
     { name: "postgres", check: async () => { await pool.query("select 1"); } },
     { name: "redis", check: async () => { await redis.ping(); } },

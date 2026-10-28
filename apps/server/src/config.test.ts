@@ -24,6 +24,7 @@ describe("loadConfig", () => {
       nodeEnv: "production", port: 9000,
       databaseUrl: "postgres://d", redisUrl: "redis://r",
       cookieSecure: true,
+      trustProxy: false,
     });
   });
 

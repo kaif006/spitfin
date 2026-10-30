@@ -19,8 +19,7 @@ const app = buildApp({
   auth: { db: pool, redis, cookieSecure: config.cookieSecure },
 });
 
-const wss = attachWs(app.server);
-
+const wss = attachWs(app.server, { tickets: redis });
 // Bring the database schema up to date before accepting any traffic.
 // If this fails, exit non-zero so Docker shows the container as failed
 // instead of serving requests against a missing schema.

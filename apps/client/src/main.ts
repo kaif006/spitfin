@@ -419,12 +419,36 @@ requestAnimationFrame(frame);
 
 // ---------- Network smoke test ----------
 const statusEl = document.querySelector<HTMLDivElement>("#status")!;
-const proto = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${proto}://${location.host}/ws`);
-ws.onopen = () => ws.send(JSON.stringify({ t: "ping", n: 1 }));
-ws.onmessage = (e) => {
-  const m: ServerMsg = JSON.parse(e.data);
-  if (m.t === "welcome") statusEl.textContent = `connected (server ${m.tickHz} Hz)`;
-};
-ws.onclose = () => (statusEl.textContent = "disconnected");
-ws.onerror = () => (statusEl.textContent = "connection error");
+
+// Temporary: until the login page (step 8) exists, sign in as a guest and fetch a ticket.
+async function getWsTicket(): Promise<string> {
+  let res = await fetch("/api/auth/me");
+  if (res.status === 401) res = await fetch("/api/auth/guest", { method: "POST" });
+  if (!res.ok) throw new Error(`sign-in failed (${res.status})`);
+  const { csrfToken } = (await res.json()) as { csrfToken: string };
+
+  const t = await fetch("/api/auth/ws-ticket", {
+    method: "POST",
+    headers: { "X-CSRF-Token": csrfToken },
+  });
+  if (!t.ok) throw new Error(`ticket failed (${t.status})`);
+  return ((await t.json()) as { ticket: string }).ticket;
+}
+
+async function connect(): Promise<void> {
+  try {
+    const ticket = await getWsTicket();
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws?ticket=${encodeURIComponent(ticket)}`);
+    ws.onopen = () => ws.send(JSON.stringify({ t: "ping", n: 1 }));
+    ws.onmessage = (e) => {
+      const m: ServerMsg = JSON.parse(e.data);
+      if (m.t === "welcome") statusEl.textContent = `connected (server ${m.tickHz} Hz)`;
+    };
+    ws.onclose = () => (statusEl.textContent = "disconnected");
+    ws.onerror = () => (statusEl.textContent = "connection error");
+  } catch {
+    statusEl.textContent = "connection error";
+  }
+}
+void connect();

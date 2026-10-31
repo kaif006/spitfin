@@ -2,13 +2,14 @@ import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { TICK_HZ, decodeClient, encodeServer } from "@spitfin/shared";
+import { rewindFromRtt, smoothRtt } from "./rooms/lag.js";
 import type { Connection, Lobby } from "./rooms/lobby.js";
 import { originAllowed } from "./security/csrf.js";
 import { TokenBucket } from "./security/bucket.js";
 import { consumeTicket, type TicketStore } from "./security/ticket.js";
 
 /** The part of the lobby the socket layer uses, so tests can pass a fake. */
-export type WsLobby = Pick<Lobby, "connect" | "disconnect" | "join" | "leave" | "input">;
+export type WsLobby = Pick<Lobby, "connect" | "disconnect" | "join" | "leave" | "input" | "setRewind">;
 
 export type WsDeps = {
   tickets: TicketStore;
@@ -17,11 +18,15 @@ export type WsDeps = {
   findName: (userId: string) => Promise<string | null>;
   /** Cap on messages per socket. Defaults to WS_MSG_RATE and WS_MSG_BURST. */
   rate?: { perSecond: number; burst: number };
+  /** How often the server pings each socket to measure latency, in ms. Defaults to WS_PING_MS. */
+  pingMs?: number;
 };
 
 /** About 40 messages per second per socket (Section 10). The client sends 30 inputs a second plus pings. */
 export const WS_MSG_RATE = 40;
 export const WS_MSG_BURST = 80;
+/** Latency is measured with a WebSocket ping frame this often. */
+export const WS_PING_MS = 2000;
 
 /** A socket whose ticket was accepted. `userId` is who the ticket was issued for. */
 export type AuthedSocket = WebSocket & { userId: string; displayName: string };
@@ -37,6 +42,7 @@ export function attachWs(server: Server, deps: WsDeps): WebSocketServer {
   // maxPayload mirrors the 1 KB cap from the security plan.
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const rate = deps.rate ?? { perSecond: WS_MSG_RATE, burst: WS_MSG_BURST };
+  const pingMs = deps.pingMs ?? WS_PING_MS;
 
   async function upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
     // A client that vanishes mid-handshake is not an error worth crashing for.
@@ -85,6 +91,7 @@ export function attachWs(server: Server, deps: WsDeps): WebSocketServer {
   wss.on("connection", (raw) => {
     const ws = raw as AuthedSocket;
     const { userId, displayName } = ws;
+    const lobby = deps.lobby;
     const bucket = new TokenBucket(rate.perSecond, rate.burst);
 
     const send = (data: string) => {
@@ -95,11 +102,28 @@ export function attachWs(server: Server, deps: WsDeps): WebSocketServer {
       close: (code, reason) => ws.close(code, reason),
     };
 
+    // Latency: ping frames are answered by the browser itself, so the client needs no code for this.
+    let pingSentAt = 0; // 0 means no ping is waiting for its pong
+    let rtt: number | null = null;
+    const pinger = setInterval(() => {
+      if (ws.readyState !== ws.OPEN) return;
+      pingSentAt = performance.now();
+      ws.ping();
+    }, pingMs);
+    ws.on("pong", () => {
+      if (pingSentAt === 0) return; // not an answer to one of our pings
+      rtt = smoothRtt(rtt, performance.now() - pingSentAt);
+      pingSentAt = 0;
+      lobby.setRewind(userId, rewindFromRtt(rtt));
+    });
+
     // A socket error is always followed by a close, which does the cleanup.
     ws.on("error", () => { });
-    ws.on("close", () => lobby.disconnect(userId, conn));
+    ws.on("close", () => {
+      clearInterval(pinger);
+      lobby.disconnect(userId, conn);
+    });
 
-    const lobby = deps.lobby;
     send(encodeServer({ t: "welcome", tickHz: TICK_HZ }));
     lobby.connect(userId, displayName, conn);
 

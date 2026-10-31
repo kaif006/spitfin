@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket, type WebSocketServer } from "ws";
-import { TICK_HZ } from "@spitfin/shared";
+import { LAG_REWIND_MAX, TICK_HZ } from "@spitfin/shared";
 import type { Connection } from "./rooms/lobby.js";
 import { fakeRedis } from "./test-support/fakeRedis.js";
 import { issueTicket } from "./security/ticket.js";
@@ -38,6 +38,9 @@ function fakeLobby() {
     input(userId, msg) {
       calls.push(["input", userId, msg]);
       return true;
+    },
+    setRewind(userId, seconds) {
+      calls.push(["setRewind", userId, seconds]);
     },
   };
   return lobby;
@@ -255,6 +258,17 @@ describe("messages", () => {
     const closed = closing(ws);
     for (let i = 0; i < 20; i++) ws.send(JSON.stringify({ t: "ping", n: i }));
     expect(await closed).toEqual({ code: 1008, reason: "rate" });
+  });
+
+  it("measures latency with ping frames and passes it to the lobby", async () => {
+    await stop();
+    await start({ pingMs: 20 });
+    await signedIn("user-4");
+    await until(() => calls("setRewind").length >= 1);
+    const [, id, seconds] = calls("setRewind")[0]!;
+    expect(id).toBe("user-4");
+    expect(seconds as number).toBeGreaterThanOrEqual(0);
+    expect(seconds as number).toBeLessThanOrEqual(LAG_REWIND_MAX);
   });
 });
 

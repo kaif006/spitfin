@@ -11,3 +11,5 @@ export * from "./nip";
 export * from "./match";
 export * from "./aim";
 export * from "./collide";
+
+export * from "./codec";

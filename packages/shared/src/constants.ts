@@ -61,3 +61,9 @@ export const LAG_REWIND_MAX = 0.15; // seconds of lag compensation allowed
 
 // Fish collision
 export const FISH_RADIUS = 0.35; // fish vs reeds and rocks. Small enough to fit the smallest obstacle gap (OBSTACLE_GAP).
+
+// Milestone 3, step 2: soft fish collisions and the nip dash
+/** Share of a fish-vs-fish overlap removed per tick (0 to 1). 1 separates fully in one tick. */
+export const FISH_PUSH = 0.5;
+/** Speed of the forced forward dash during a nip, in units per second (6 u/s). */
+export const NIP_DASH_SPEED = NIP_RANGE / NIP_DURATION;

@@ -3,11 +3,13 @@ import { makeBugSpec } from "./bugs";
 import type { BugSpec } from "./bugs";
 import { resolveEating } from "./eating";
 import type { EatEvent, ShotBug } from "./eating";
-import { newNipper, tryNip, updateFacing } from "./nip";
+import { isDashing, newNipper, tryNip, updateFacing } from "./nip";
 import type { Nipper } from "./nip";
 import { generateObstacles } from "./obstacles";
 import type { Obstacle } from "./obstacles";
 import { collideFish } from "./collide";
+import { stepDash } from "./dash";
+import { separateFish } from "./bump";
 import { stepFish } from "./sim";
 import { newSpitter, trySpit } from "./spit";
 import type { SpitContext, Spitter } from "./spit";
@@ -131,10 +133,22 @@ export function stepSim(
     const inp = inputs[i] ?? IDLE_SIM_INPUT;
     const ax = num(inp.ax);
     const az = num(inp.az);
-    stepFish(ps[i], ax, az, TICK_DT);
-    collideFish(ps[i], s.obstacles);
-    updateFacing(ps[i], ax, az);
+    if (isDashing(ps[i], t)) {
+      // A nip dash ignores steering, and the facing stays locked until it ends.
+      stepDash(ps[i], ps[i].facing, TICK_DT);
+      collideFish(ps[i], s.obstacles);
+    } else {
+      stepFish(ps[i], ax, az, TICK_DT);
+      collideFish(ps[i], s.obstacles);
+      updateFacing(ps[i], ax, az);
+    }
   }
+
+  // Fish push each other apart a little. Anyone pushed is kept out of reeds, rocks and the arena edge.
+  if (separateFish(ps)) {
+    for (let i = 0; i < ps.length; i++) collideFish(ps[i], s.obstacles);
+  }
+
 
   for (let i = 0; i < ps.length; i++) {
     const inp = inputs[i] ?? IDLE_SIM_INPUT;

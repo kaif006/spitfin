@@ -5,15 +5,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p . && vite build",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@spitfin/shared": "workspace:*",
+    "preact": "^11.1.0",
     "three": "^0.186.1"
   },
   "devDependencies": {
     "@types/three": "^0.186.0",
     "typescript": "^7.0.2",
-    "vite": "^8.3.5"
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
   }
 }

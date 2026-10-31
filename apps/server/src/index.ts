@@ -2,8 +2,10 @@ import { loadConfig } from "./config";
 import { buildApp } from "./app";
 import { attachWs } from "./ws";
 import { createPool } from "./db/pool";
+import { findUserById } from "./db/users";
 import { readMigrations, runMigrations } from "./db/migrate";
 import { createRedis } from "./redis";
+import { Lobby } from "./rooms/lobby";
 
 const config = loadConfig();
 const pool = createPool(config.databaseUrl);
@@ -19,7 +21,14 @@ const app = buildApp({
   auth: { db: pool, redis, cookieSecure: config.cookieSecure },
 });
 
-const wss = attachWs(app.server, { tickets: redis });
+// One lobby for the whole process: matchmaking and rooms live in memory (Section 19, decision 6).
+const lobby = new Lobby({ onError: (err) => app.log.error({ err }, "lobby error") });
+
+const wss = attachWs(app.server, {
+  tickets: redis,
+  lobby,
+  findName: async (userId) => (await findUserById(pool, userId))?.displayName ?? null,
+});
 // Bring the database schema up to date before accepting any traffic.
 // If this fails, exit non-zero so Docker shows the container as failed
 // instead of serving requests against a missing schema.
@@ -43,6 +52,8 @@ async function shutdown(signal: string) {
   if (stopping) return;
   stopping = true;
   app.log.info(`${signal} received, shutting down`);
+  // Stop the rooms first so no timer ticks while the sockets close.
+  lobby.stop();
   // Upgraded sockets are not tracked by the HTTP server, so close them by hand.
   for (const client of wss.clients) client.terminate();
   await app.close();

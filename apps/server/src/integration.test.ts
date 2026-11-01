@@ -9,6 +9,7 @@ import { issueTicket } from "./security/ticket.js";
 import { Bot, waitUntil, type InputFields } from "./test-support/bot.js";
 import { fakeRedis } from "./test-support/fakeRedis.js";
 import { attachWs } from "./ws.js";
+import { planSteal } from "./test-support/steal-plan.js";
 
 const TICK_MS = 1000 / TICK_HZ;
 const SEED = 4242;
@@ -23,16 +24,18 @@ let lobby: Lobby;
 let store: ReturnType<typeof fakeRedis>;
 let base: string;
 let clock: number; // the lobby's and every room's clock, in ms. The tests move it by hand.
+let seed = SEED;
 let lobbyErrors: unknown[];
 const bots: Bot[] = [];
 
 beforeEach(async () => {
   clock = 0;
+  seed = SEED;
   lobbyErrors = [];
   store = fakeRedis();
   lobby = new Lobby({
     now: () => clock,
-    makeSeed: () => SEED,
+    makeSeed: () => seed,
     reconnectWindowMs: RECONNECT_WINDOW,
     onError: (err) => lobbyErrors.push(err),
   });
@@ -220,6 +223,74 @@ describe("reconnecting", () => {
       await waitUntil(() => a3.queued.length > 0, "queued after the window");
       expect(a3.queued[0]).toBe(1);
       expect(a3.errors).toEqual([]);
+      expect(lobbyErrors).toEqual([]);
+    },
+    60_000,
+  );
+});
+
+describe("stealing", () => {
+  it(
+    "a nip takes a bug from a stash and the next snapshots show it",
+    async () => {
+      const plan = planSteal();
+      seed = plan.seed;
+      const { a, b, room } = await startTwoBotMatch();
+      const victim = a.start?.you === 0 ? a : b;
+      const thief = victim === a ? b : a;
+      expect(victim.start?.you).toBe(0);
+      expect(thief.start?.you).toBe(1);
+
+      const step = async (v: Partial<InputFields>, t: Partial<InputFields>): Promise<void> => {
+        victim.input(v);
+        thief.input(t);
+        await yieldIo();
+        clock += TICK_MS;
+        room.pump();
+      };
+
+      const stashOf = (bot: Bot, id: number) => bot.lastSnap?.players[id]?.stash ?? 0;
+
+      // Phase 1: fish 0 spits at the planned tick and stands still until the bug is in its stash.
+      for (let i = 0; i < 400 && stashOf(victim, 0) < 1; i++) {
+        const spit = room.tick === plan.tick - 1;
+        await step(spit ? { spit: true, yaw: plan.yaw, pitch: plan.pitch } : {}, {});
+      }
+      expect(stashOf(victim, 0)).toBe(1);
+      const spitEvent = victim.events.find((e) => e.type === "spit" && e.playerId === 0);
+      expect(spitEvent).toBeDefined();
+      expect(spitEvent?.type === "spit" ? spitEvent.hit : null).not.toBeNull();
+
+      // Phase 2: fish 1 swims straight at fish 0 and nips once it is close.
+      let nipped = false;
+      let nipTick = -1;
+      for (let i = 0; i < 400 && nipTick < 0; i++) {
+        const me = thief.lastSnap?.players[1];
+        const him = thief.lastSnap?.players[0];
+        const close = me !== undefined && him !== undefined && Math.hypot(me.x - him.x, me.z - him.z) <= 1.3;
+        const fire = close && !nipped;
+        if (fire) nipped = true;
+        await step({}, { ax: 1, nip: fire });
+        const ev = thief.events.find((e) => e.type === "nip" && e.thiefId === 1);
+        if (ev) nipTick = ev.tick;
+      }
+      expect(nipTick).toBeGreaterThan(0);
+
+      const nip = thief.events.find((e) => e.type === "nip" && e.thiefId === 1);
+      expect(nip).toMatchObject({ type: "nip", thiefId: 1, victimId: 0 });
+
+      // Phase 3: a later snapshot shows the bug moved from the victim to the thief.
+      for (let i = 0; i < 10; i++) await step({}, {});
+      await waitUntil(
+        () => (thief.lastSnap?.tick ?? 0) > nipTick && (victim.lastSnap?.tick ?? 0) > nipTick,
+        "snapshots after the nip",
+      );
+      for (const bot of [thief, victim]) {
+        expect(stashOf(bot, 0)).toBe(0);
+        expect(stashOf(bot, 1)).toBe(1);
+      }
+      expect(thief.errors).toEqual([]);
+      expect(victim.errors).toEqual([]);
       expect(lobbyErrors).toEqual([]);
     },
     60_000,

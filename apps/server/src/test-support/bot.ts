@@ -1,6 +1,6 @@
 import { WebSocket } from "ws";
 import { decodeServer, encodeClient } from "@spitfin/shared";
-import type { ClientMsg, ServerMsg } from "@spitfin/shared";
+import type { ClientMsg, ServerMsg, WireEvent } from "@spitfin/shared";
 
 type Msg<T extends ServerMsg["t"]> = Extract<ServerMsg, { t: T }>;
 
@@ -36,6 +36,8 @@ export class Bot {
   travel = 0;
   /** How many events of each type arrived. */
   eventTypes = new Map<string, number>();
+  /** Every event received, in order. */
+  events: WireEvent[] = [];
   /** Messages that `decodeServer` rejected. */
   undecodable = 0;
   closed: { code: number; reason: string } | null = null;
@@ -139,6 +141,7 @@ export class Bot {
     if (this.lastSnap !== null && m.tick < this.lastSnap.tick) this.ticksNeverGoBack = false;
     this.lastSnap = m;
     this.snapCount += 1;
+    for (const e of m.events) this.events.push(e);
     for (const e of m.events) this.eventTypes.set(e.type, (this.eventTypes.get(e.type) ?? 0) + 1);
 
     const me = this.start === null ? undefined : m.players[this.start.you];

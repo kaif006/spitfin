@@ -5,6 +5,7 @@ import type { Session } from "../auth/api";
 import { failureMessage } from "../auth/messages";
 import { LoginPage } from "./LoginPage";
 import { Pond } from "./Pond";
+import { LobbyPanel } from "./LobbyPanel";
 import "./login.css";
 
 type Phase =
@@ -44,13 +45,16 @@ function GameShell({ session }: { session: Session }) {
   }
 
   return (
-    <div class="session-bar">
-      <span>{session.user.displayName}</span>
-      <button type="button" onClick={() => void logout()} disabled={busy}>
-        Log out
-      </button>
-      {msg && <span class="session-msg">{msg}</span>}
-    </div>
+    <>
+      <LobbyPanel />
+      <div class="session-bar">
+        <span>{session.user.displayName}</span>
+        <button type="button" onClick={() => void logout()} disabled={busy}>
+          Log out
+        </button>
+        {msg && <span class="session-msg">{msg}</span>}
+      </div>
+    </>
   );
 }
 

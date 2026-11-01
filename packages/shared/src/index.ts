@@ -11,5 +11,7 @@ export * from "./nip";
 export * from "./match";
 export * from "./aim";
 export * from "./collide";
+export * from "./dash";
+export * from "./bump";
 
 export * from "./codec";

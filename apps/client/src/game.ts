@@ -2,32 +2,35 @@ import * as THREE from "three";
 import {
   ARENA,
   BUG_HIT_RADIUS,
+  BUG_SPAWN_INTERVAL,
   MATCH_DURATION,
-  NOT_EATEN,
   REED_HEIGHT,
   ROCK_HEIGHT,
   SPIT_ORIGIN_Y,
+  SPIT_RANGE,
+  SPIT_COOLDOWN,
   SPIT_PITCH_MAX,
   SPIT_PITCH_MIN,
   TICK_DT,
+  TICK_HZ,
+  LAG_REWIND_MAX,
   bugPosition,
   fallingBugPhase,
   fallingBugPosition,
-  isDashing,
-  makeSimInput,
-  newSim,
-  simRanking,
-  stepSim,
-  type ServerMsg,
-  type ShotBug,
-  type SimEvent,
-  type SimInput,
-  type SimPlayer,
-  type SimState,
+  generateObstacles,
+  makeBugSpec,
+  makeFallingBug,
+  type BugSpec,
+  type FallingBug,
+  type Obstacle,
   type Vec3,
+  type WireEvent,
 } from "@spitfin/shared";
 import { pickAim } from "./Picking";
-import { getWsTicket } from "./auth/session";
+import { match, net } from "./net/match";
+import type { MatchState } from "./net/matchStore";
+import { angleDiff, sampleFrames, type Frame, type Shown } from "./net/snapshots";
+import { Predictor } from "./net/predict";
 
 // ---------- Renderer & orthographic camera ----------
 const canvas = document.querySelector<HTMLCanvasElement>("#game")!;
@@ -84,7 +87,8 @@ scene.add(water);
 
 // ---------- Shared meshes and materials ----------
 const fishGeo = new THREE.ConeGeometry(0.5, 1.4, 6).rotateX(Math.PI / 2); // tip points +Z
-const fishMat = new THREE.MeshLambertMaterial({ color: 0xf28f3b });
+const FISH_COLORS = [0xf28f3b, 0x4f86f7, 0xe05d9c, 0x7bc74d]; // your own fish is always the first (orange)
+const fishMats = FISH_COLORS.map((c) => new THREE.MeshLambertMaterial({ color: c }));
 const bugGeo = new THREE.SphereGeometry(BUG_HIT_RADIUS, 10, 8);
 const flyingMat = new THREE.MeshLambertMaterial({ color: 0x2b2118 });
 const floatingMat = new THREE.MeshLambertMaterial({ color: 0xd6a02e });
@@ -92,32 +96,64 @@ const reedMat = new THREE.MeshLambertMaterial({ color: 0x5f8f3e });
 const rockMat = new THREE.MeshLambertMaterial({ color: 0x8c8c86 });
 
 const obstacleGroup = new THREE.Group();
+const fishGroup = new THREE.Group();
 const bugGroup = new THREE.Group();
-scene.add(obstacleGroup, bugGroup);
+scene.add(obstacleGroup, fishGroup, bugGroup);
+obstacleGroup.visible = fishGroup.visible = bugGroup.visible = false;
 
-// The spit jet: a thin cylinder from the mouth, pointing along +Z, scaled to the jet length.
-const jet = new THREE.Mesh(
-  new THREE.CylinderGeometry(0.05, 0.05, 1, 6).rotateX(Math.PI / 2).translate(0, 0, 0.5),
-  new THREE.MeshBasicMaterial({ color: 0x9be7ff }),
-);
-jet.visible = false;
-scene.add(jet);
-const jetStart = new THREE.Vector3();
-const jetEnd = new THREE.Vector3();
-let jetUntil = 0;
+// One spit jet per player: a thin cylinder from the mouth, pointing along +Z, scaled to the jet length.
+const jetGeo = new THREE.CylinderGeometry(0.05, 0.05, 1, 6).rotateX(Math.PI / 2).translate(0, 0, 0.5);
+const jetMat = new THREE.MeshBasicMaterial({ color: 0x9be7ff });
+const jets = [0, 1, 2, 3].map(() => {
+  const m = new THREE.Mesh(jetGeo, jetMat);
+  m.visible = false;
+  scene.add(m);
+  return m;
+});
+const jetStart = jets.map(() => new THREE.Vector3());
+const jetEnd = jets.map(() => new THREE.Vector3());
+const jetUntil = jets.map(() => 0);
 
 // ---------- HUD ----------
 const hud = document.createElement("div");
 hud.style.cssText =
   "position:fixed;top:8px;left:50%;transform:translateX(-50%);padding:6px 14px;background:rgba(30,30,30,.55);" +
-  "color:#fff;font:600 14px/1.5 system-ui,sans-serif;border-radius:8px;pointer-events:none;text-align:center;white-space:pre;";
+  "color:#fff;font:600 14px/1.5 system-ui,sans-serif;border-radius:8px;pointer-events:none;text-align:center;white-space:pre;display:none;";
 document.body.appendChild(hud);
 
-const banner = document.createElement("div");
-banner.style.cssText =
-  "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);padding:20px 32px;background:rgba(20,20,20,.8);" +
-  "color:#fff;font:600 18px/1.6 system-ui,sans-serif;border-radius:12px;pointer-events:none;text-align:center;white-space:pre;display:none;";
-document.body.appendChild(banner);
+// ---------- Match state ----------
+/** Fish and bugs are drawn this far behind the newest snapshot (two snapshot intervals at 15 Hz). */
+const INTERP_DELAY = 2 / 15;
+const MAX_FRAMES = 40;
+
+type SpitEvent = Extract<WireEvent, { type: "spit" }>;
+
+let active = false;
+let seed = 0;
+let you = -1;
+let roster: MatchState["roster"] = [];
+let specs: BugSpec[] = [];
+let hits = new Map<number, { fall: FallingBug; eatTime: number }>();
+let frames: Frame[] = [];
+let latestArrival = 0;
+let renderT = -1;
+let fx: SpitEvent[] = [];
+let fishMeshes: THREE.Mesh[] = [];
+let bugMeshes: THREE.Mesh[] = [];
+let acc = 0;
+let obstacles: Obstacle[] = [];
+let predictor: Predictor | null = null;
+let prevPX = 0;
+let prevPZ = 0;
+let errX = 0; // a correction from the server, eased out over a few frames
+let errZ = 0;
+let ownYaw = 0;
+/** The match time at which the server will test a spit sent now (bugs are drawn and aimed at this time). */
+let bugT = 0;
+const shown: Shown[] = [];
+const lastAim = { yaw: 0, pitch: 0 };
+let spitReadyAt = 0; // performance.now() time at which the local spit is off cooldown
+const localJets: number[] = []; // times of locally drawn jets whose server event has not arrived yet
 
 // ---------- Input ----------
 const keys = new Set<string>();
@@ -129,11 +165,10 @@ let pointerY = window.innerHeight / 2;
 
 window.addEventListener("keydown", (e) => {
   keys.add(e.code);
-  if (e.code === "Space") {
+  if (e.code === "Space" && active) {
     pendingNip = true;
     e.preventDefault();
   }
-  if (e.code === "KeyR" && sim.over) startMatch(randomSeed());
 });
 window.addEventListener("keyup", (e) => keys.delete(e.code));
 window.addEventListener("blur", () => {
@@ -145,7 +180,7 @@ window.addEventListener("pointermove", (e) => {
   pointerY = e.clientY;
 });
 window.addEventListener("pointerdown", (e) => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || e.target !== canvas) return;
   pointerX = e.clientX;
   pointerY = e.clientY;
   mouseDown = true;
@@ -164,33 +199,18 @@ function readAxis() {
   out.az = (-sy - sx) * k;
 }
 
-// ---------- Match state ----------
-const TAU = Math.PI * 2;
-const randomSeed = () => (Math.random() * 0x100000000) >>> 0;
-const urlSeed = new URLSearchParams(location.search).get("seed");
-
-let sim: SimState;
-let seed = 0;
-let bannerShown = false;
-let fishMeshes: THREE.Mesh[] = [];
-let meshYaw: number[] = [];
-let prevX: number[] = [];
-let prevZ: number[] = [];
-let bugMeshes: THREE.Mesh[] = [];
-const shotById = new Map<number, ShotBug>();
-let shotSeen = 0;
-
-const input: SimInput = makeSimInput();
-const inputs: SimInput[] = [input];
-const events: SimEvent[] = [];
+// ---------- Building the match ----------
 const candidates: Vec3[] = [];
 const candidatePool: Vec3[] = [];
 const scratch: Vec3 = { x: 0, y: 0, z: 0 };
 
-function buildObstacles(s: SimState) {
+/** Your fish is colour 0; the others take the rest in id order. */
+const colorIndex = (id: number) => (id === you ? 0 : id < you ? id + 1 : id);
+
+function buildObstacles(list: readonly Obstacle[]) {
   for (const m of obstacleGroup.children) (m as THREE.Mesh).geometry.dispose();
   obstacleGroup.clear();
-  for (const o of s.obstacles) {
+  for (const o of list) {
     const top = o.kind === "reed" ? REED_HEIGHT : ROCK_HEIGHT;
     const h = top - FLOOR_Y;
     const geo =
@@ -203,51 +223,113 @@ function buildObstacles(s: SimState) {
   }
 }
 
-function startMatch(newSeed: number) {
-  seed = newSeed;
-  sim = newSim(seed, [0]);
-  shotById.clear();
-  shotSeen = 0;
-
-  for (const m of fishMeshes) scene.remove(m);
-  fishMeshes = sim.players.map(() => {
-    const m = new THREE.Mesh(fishGeo, fishMat);
-    m.position.y = -0.25;
-    scene.add(m);
-    return m;
-  });
-  meshYaw = sim.players.map((p) => Math.PI / 2 - p.facing);
-  prevX = sim.players.map((p) => p.x);
-  prevZ = sim.players.map((p) => p.z);
-
-  for (const m of bugMeshes) bugGroup.remove(m);
-  bugMeshes = [];
-  buildObstacles(sim);
-
+function beginMatch(s: MatchState) {
+  seed = s.seed;
+  you = s.you;
+  roster = s.roster;
+  specs = [];
+  hits = new Map();
+  frames = [];
+  fx = [];
+  renderT = -1;
+  latestArrival = 0;
+  acc = 0;
+  shown.length = 0;
   pendingSpit = false;
   pendingNip = false;
-  jet.visible = false;
-  jetUntil = 0;
-  banner.style.display = "none";
-  bannerShown = false;
-  acc = 0;
+  spitReadyAt = 0;
+  localJets.length = 0;
+
+  obstacles = generateObstacles(seed);
+  buildObstacles(obstacles);
+  predictor = null;
+  errX = 0;
+  errZ = 0;
+  bugT = 0;
+  fishGroup.clear();
+  fishMeshes = roster.map((r) => {
+    const m = new THREE.Mesh(fishGeo, fishMats[colorIndex(r.id)]!);
+    m.position.y = -0.25;
+    fishGroup.add(m);
+    return m;
+  });
+  for (const m of bugMeshes) bugGroup.remove(m);
+  bugMeshes = [];
+  for (let i = 0; i < jets.length; i++) {
+    jets[i]!.visible = false;
+    jetUntil[i] = 0;
+  }
+  hud.style.display = "block";
+  active = true;
 }
 
-/** Remember which bugs have been shot, so rendering and aiming can look them up by id. */
-function syncShot() {
-  while (shotSeen < sim.shot.length) {
-    const sb = sim.shot[shotSeen++];
-    shotById.set(sb.fall.bugId, sb);
+let lastPhase = match.state.phase;
+function onMatchState() {
+  const s = match.state;
+  if (s.phase === "playing" && lastPhase !== "playing") beginMatch(s);
+  if (s.phase !== "playing") {
+    active = false;
+    hud.style.display = "none";
+    keys.clear();
+    mouseDown = false;
+  }
+  const show = s.phase === "playing" || s.phase === "ended";
+  obstacleGroup.visible = fishGroup.visible = bugGroup.visible = show;
+  lastPhase = s.phase;
+}
+match.subscribe(onMatchState);
+onMatchState();
+
+// ---------- Snapshots in ----------
+function ingest(e: WireEvent) {
+  const t = e.tick / TICK_HZ;
+  if (e.type === "spit") {
+    if (e.hit) hits.set(e.hit.bugId, { fall: makeFallingBug(seed, e.hit.bugId, t, e.hit), eatTime: Infinity });
+    fx.push(e);
+  } else if (e.type === "eat") {
+    const h = hits.get(e.bugId);
+    if (h) h.eatTime = t;
   }
 }
 
-/** Positions of every bug that a spit fired at time `t` could still hit. */
+match.onSnap((s) => {
+  if (!active) return;
+  const newest = frames[frames.length - 1];
+  if (newest && s.tick <= newest.tick) return;
+  frames.push({ tick: s.tick, t: s.tick / TICK_HZ, players: s.players });
+  if (frames.length > MAX_FRAMES) frames.shift();
+  latestArrival = performance.now();
+  for (const e of s.events) ingest(e);
+
+  const me = s.players[you];
+  if (!me) return;
+  if (!predictor) {
+    predictor = new Predictor(obstacles);
+    predictor.reset(me);
+    prevPX = me.x;
+    prevPZ = me.z;
+    ownYaw = Math.PI / 2 - me.facing;
+  } else {
+    const d = predictor.reconcile(me, s.ack);
+    prevPX += d.dx;
+    prevPZ += d.dz;
+    errX -= d.dx;
+    errZ -= d.dz;
+    if (Math.hypot(errX, errZ) > 3) {
+      errX = 0;
+      errZ = 0;
+    }
+  }
+});
+
+// ---------- Input out ----------
+/** Positions of every bug that a spit could still hit, as seen on screen at time `t`. */
 function collectTargets(t: number) {
   candidates.length = 0;
-  for (let i = 0; i < sim.bugs.length; i++) {
-    const b = sim.bugs[i];
+  for (let i = 0; i < specs.length; i++) {
+    const b = specs[i]!;
     if (t < b.spawnTime || t >= b.despawnTime) continue;
-    if (shotById.has(b.id)) continue;
+    if (hits.has(b.id)) continue;
     let v = candidatePool[candidates.length];
     if (!v) {
       v = { x: 0, y: 0, z: 0 };
@@ -258,70 +340,104 @@ function collectTargets(t: number) {
   }
 }
 
-/** Fill `input` for the next tick. Clicks and key presses are consumed here. */
-function buildInput(p: SimPlayer) {
+function sendTick() {
+  const pr = predictor;
+  if (!pr || net.status !== "open") {
+    pendingSpit = false;
+    pendingNip = false;
+    return;
+  }
   readAxis();
-  input.ax = out.ax;
-  input.az = out.az;
-  input.spit = false;
+  const move = { ax: out.ax, az: out.az, nip: pendingNip };
+  prevPX = pr.body.x;
+  prevPZ = pr.body.z;
+  pr.step(move); // the server moves first and spits from the new position
+
+  let spit = false;
+  let yaw = 0;
+  let pitch = 0;
   if (mouseDown || pendingSpit) {
-    collectTargets(sim.time + TICK_DT); // the spit is resolved at the next tick's time
-    const aim = pickAim(pointerX, pointerY, canvas, camera, p.x, p.z, candidates);
+    collectTargets(bugT);
+    const aim = pickAim(pointerX, pointerY, canvas, camera, pr.body.x, pr.body.z, candidates);
     if (aim) {
-      input.spit = true;
-      input.yaw = aim.yaw;
-      input.pitch = aim.pitch;
+      spit = true;
+      yaw = aim.yaw;
+      pitch = aim.pitch;
+      lastAim.yaw = yaw;
+      lastAim.pitch = pitch;
+      const nowMs = performance.now();
+      if (nowMs >= spitReadyAt) {
+        spitReadyAt = nowMs + SPIT_COOLDOWN * 1000;
+        localJets.push(nowMs);
+        const p = Math.min(SPIT_PITCH_MAX, Math.max(SPIT_PITCH_MIN, pitch));
+        const cp = Math.cos(p);
+        jetStart[you]!.set(pr.body.x, SPIT_ORIGIN_Y, pr.body.z);
+        jetEnd[you]!.set(
+          pr.body.x + cp * Math.cos(yaw) * SPIT_RANGE,
+          SPIT_ORIGIN_Y + Math.sin(p) * SPIT_RANGE,
+          pr.body.z + cp * Math.sin(yaw) * SPIT_RANGE,
+        );
+        jetUntil[you] = nowMs + 140;
+      }
     }
   }
-  input.nip = pendingNip;
+  const seq = net.sendInput({ ax: move.ax, az: move.az, spit, yaw, pitch, nip: move.nip });
+  if (seq > 0) pr.commit(seq, move);
   pendingSpit = false;
   pendingNip = false;
 }
 
-function handleEvents(p: SimPlayer) {
-  for (const e of events) {
-    if (e.type !== "spit" || e.playerId !== p.id) continue;
-    const pitch = Math.min(SPIT_PITCH_MAX, Math.max(SPIT_PITCH_MIN, input.pitch));
-    const cp = Math.cos(pitch);
-    jetStart.set(p.x, SPIT_ORIGIN_Y, p.z);
-    jetEnd.set(
-      p.x + cp * Math.cos(input.yaw) * e.length,
-      SPIT_ORIGIN_Y + Math.sin(pitch) * e.length,
-      p.z + cp * Math.sin(input.yaw) * e.length,
-    );
-    jetUntil = performance.now() + 140;
+// ---------- Drawing ----------
+function syncClock(lf: Frame, dt: number, now: number) {
+  const target = Math.min(lf.t, lf.t + (now - latestArrival) / 1000 - INTERP_DELAY);
+  if (renderT < 0 || Math.abs(target - renderT) > 0.5) {
+    renderT = target;
+  } else {
+    renderT += dt;
+    renderT += (target - renderT) * 0.1;
+  }
+  renderT = Math.max(0, Math.min(renderT, lf.t));
+}
+
+function ensureSpecs(t: number) {
+  while (specs.length * BUG_SPAWN_INTERVAL < MATCH_DURATION && specs.length * BUG_SPAWN_INTERVAL <= t + 1e-9) {
+    specs.push(makeBugSpec(seed, specs.length, obstacles));
   }
 }
 
-function updateBugs(renderTime: number) {
-  while (bugMeshes.length < sim.bugs.length) {
+/** The match time at which the server will test a spit sent now: when it arrives, minus the lag rewind. */
+function bugClock(lf: Frame, now: number): number {
+  const rtt = net.rtt / 1000;
+  const rewind = Math.min(LAG_REWIND_MAX, rtt / 2);
+  const age = Math.min(0.5, (now - latestArrival) / 1000);
+  return Math.max(0, lf.t + age + rtt + TICK_DT - rewind);
+}
+
+function updateBugs(t: number, tb: number) {
+  while (bugMeshes.length < specs.length) {
     const m = new THREE.Mesh(bugGeo, flyingMat);
     m.visible = false;
     bugGroup.add(m);
     bugMeshes.push(m);
   }
-  for (let i = 0; i < sim.bugs.length; i++) {
-    const spec = sim.bugs[i];
-    const m = bugMeshes[i];
-    const sb = shotById.get(spec.id);
-    if (sb) {
-      if (sb.eatenBy !== NOT_EATEN) {
+  for (let i = 0; i < specs.length; i++) {
+    const spec = specs[i]!;
+    const m = bugMeshes[i]!;
+    const h = hits.get(spec.id);
+    if (h && t >= h.fall.hitTime) {
+      const phase = fallingBugPhase(h.fall, t);
+      if (t >= h.eatTime || phase === "expired") {
         m.visible = false;
         continue;
       }
-      const phase = fallingBugPhase(sb.fall, renderTime);
-      if (phase === "expired") {
-        m.visible = false;
-        continue;
-      }
-      fallingBugPosition(sb.fall, renderTime, scratch);
+      fallingBugPosition(h.fall, t, scratch);
       m.material = phase === "floating" ? floatingMat : flyingMat;
     } else {
-      if (renderTime < spec.spawnTime || renderTime >= spec.despawnTime) {
+      if (tb < spec.spawnTime || tb >= spec.despawnTime) {
         m.visible = false;
         continue;
       }
-      bugPosition(spec, renderTime, scratch);
+      bugPosition(spec, tb, scratch);
       m.material = flyingMat;
     }
     m.visible = true;
@@ -329,112 +445,126 @@ function updateBugs(renderTime: number) {
   }
 }
 
+/** Starts the jet of every spit whose moment has been reached on screen. */
+function runFx(t: number, now: number) {
+  while (fx.length > 0 && fx[0]!.tick / TICK_HZ <= t) {
+    const e = fx.shift()!;
+    const id = e.playerId;
+    const f = shown[id];
+    if (!f || id >= jets.length) continue;
+    if (id === you) {
+      while (localJets.length > 0 && now - localJets[0]! > 1500) localJets.shift();
+      if (localJets.length > 0) {
+        localJets.shift(); // already drawn when you clicked
+        continue;
+      }
+    }
+    jetStart[id]!.set(f.x, SPIT_ORIGIN_Y, f.z);
+    if (e.hit) {
+      jetEnd[id]!.set(e.hit.x, e.hit.y, e.hit.z);
+    } else {
+      // The wire carries no aim, so other players' misses point the way they face.
+      const own = id === you;
+      const yaw = own ? lastAim.yaw : f.facing;
+      const pitch = own ? Math.min(SPIT_PITCH_MAX, Math.max(SPIT_PITCH_MIN, lastAim.pitch)) : 0;
+      const cp = Math.cos(pitch);
+      jetEnd[id]!.set(
+        f.x + cp * Math.cos(yaw) * e.length,
+        SPIT_ORIGIN_Y + Math.sin(pitch) * e.length,
+        f.z + cp * Math.sin(yaw) * e.length,
+      );
+    }
+    jetUntil[id] = now + 140;
+  }
+}
+
 const fmtCooldown = (t: number) => (t <= 0 ? "ready" : `${t.toFixed(1)}s`);
 let lastHud = "";
-function updateHud(p: SimPlayer) {
-  const secs = Math.ceil(Math.max(0, MATCH_DURATION - sim.time));
+function updateHud(lf: Frame, now: number) {
+  const me = lf.players[you];
+  if (!me) return;
+  const age = (now - latestArrival) / 1000;
+  const secs = Math.ceil(Math.max(0, MATCH_DURATION - lf.t));
   const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  const board = roster.map((r) => `${r.name} ${lf.players[r.id]?.stash ?? 0}`).join("   ");
+  const nipCd = predictor ? predictor.nipCdLeft / TICK_HZ : me.nipCd - age;
   const text =
-    `${clock}   stash ${p.stash}   eaten ${p.bugsEaten}   spit ${p.hits}/${p.shots}\n` +
-    `spit ${fmtCooldown(p.nextSpitTime - sim.time)}   nip ${fmtCooldown(p.nipReadyTime - sim.time)}   seed ${seed}`;
+    `${clock}   stash ${me.stash}   eaten ${me.eaten}   spit ${me.hits}/${me.shots}\n` +
+    `spit ${fmtCooldown(me.spitCd - age)}   nip ${fmtCooldown(nipCd)}   ping ${Math.round(net.rtt)} ms\n` +
+    board;
   if (text !== lastHud) {
     hud.textContent = text;
     lastHud = text;
   }
 }
 
-function showBanner() {
-  const rows = simRanking(sim).map(
-    (r) => `#${r.rank}  stash ${r.stash}, eaten ${r.bugsEaten}, nips ${r.nipsUsed}`,
-  );
-  banner.textContent = `Time!\n${rows.join("\n")}\nPress R to play again`;
-  banner.style.display = "block";
-  bannerShown = true;
-}
-
-/** Shortest signed angle from a to b. */
-function angleDiff(a: number, b: number): number {
-  let d = (b - a) % TAU;
-  if (d > Math.PI) d -= TAU;
-  if (d < -Math.PI) d += TAU;
-  return d;
-}
-
-// ---------- Fixed-timestep loop with render interpolation ----------
-let acc = 0;
+// ---------- Frame loop ----------
 let last = performance.now();
-startMatch(urlSeed !== null && Number.isFinite(Number(urlSeed)) ? Number(urlSeed) >>> 0 : randomSeed());
 
 function frame(now: number) {
-  acc += Math.min(0.25, (now - last) / 1000);
+  const dt = Math.min(0.25, (now - last) / 1000);
   last = now;
-  const p = sim.players[0];
+  const lf = frames[frames.length - 1];
 
-  while (acc >= TICK_DT) {
-    for (let i = 0; i < sim.players.length; i++) {
-      prevX[i] = sim.players[i].x;
-      prevZ[i] = sim.players[i].z;
+  if (active && lf) {
+    syncClock(lf, dt, now);
+    sampleFrames(frames, renderT, shown);
+    bugT = bugClock(lf, now);
+    ensureSpecs(bugT);
+
+    acc = Math.min(acc + dt, 0.1);
+    while (acc >= TICK_DT) {
+      sendTick();
+      acc -= TICK_DT;
     }
-    if (!sim.over) {
-      events.length = 0;
-      buildInput(p);
-      stepSim(sim, inputs, events);
-      syncShot();
-      handleEvents(p);
+
+    // Your own fish comes from the prediction, with the server's correction eased out.
+    const pr = predictor;
+    const own = shown[you];
+    if (pr && own) {
+      const a = acc / TICK_DT;
+      const k = Math.exp(-dt * 12);
+      errX *= k;
+      errZ *= k;
+      own.x = prevPX + (pr.body.x - prevPX) * a + errX;
+      own.z = prevPZ + (pr.body.z - prevPZ) * a + errZ;
+      own.facing = pr.body.facing;
+      own.dash = pr.dashLeft > 0;
     }
-    acc -= TICK_DT;
+
+    for (let i = 0; i < shown.length; i++) {
+      const f = shown[i]!;
+      const m = fishMeshes[i];
+      if (!m) continue;
+      m.position.x = f.x;
+      m.position.z = f.z;
+      if (i === you) {
+        ownYaw += angleDiff(ownYaw, Math.PI / 2 - f.facing) * 0.35;
+        m.rotation.y = ownYaw;
+      } else {
+        m.rotation.y = Math.PI / 2 - f.facing;
+      }
+      m.scale.setScalar(f.dash ? 1.3 : 1);
+    }
+
+    updateBugs(renderT, bugT);
+    runFx(renderT, now);
+    updateHud(lf, now);
   }
 
-  // Render between the previous and the current tick, so fish and bugs share the same moment.
-  const a = sim.over ? 1 : acc / TICK_DT;
-  const renderTime = Math.max(0, sim.time - (1 - a) * TICK_DT);
-
-  for (let i = 0; i < sim.players.length; i++) {
-    const pl = sim.players[i];
-    const m = fishMeshes[i];
-    m.position.x = prevX[i] + (pl.x - prevX[i]) * a;
-    m.position.z = prevZ[i] + (pl.z - prevZ[i]) * a;
-    meshYaw[i] += angleDiff(meshYaw[i], Math.PI / 2 - pl.facing) * 0.35;
-    m.rotation.y = meshYaw[i];
-    m.scale.setScalar(isDashing(pl, sim.time) ? 1.3 : 1);
+  for (let i = 0; i < jets.length; i++) {
+    const j = jets[i]!;
+    if (now < jetUntil[i]!) {
+      j.visible = true;
+      j.position.copy(jetStart[i]!);
+      j.lookAt(jetEnd[i]!);
+      j.scale.set(1, 1, Math.max(0.01, jetStart[i]!.distanceTo(jetEnd[i]!)));
+    } else {
+      j.visible = false;
+    }
   }
-
-  updateBugs(renderTime);
-
-  if (now < jetUntil) {
-    jet.visible = true;
-    jet.position.copy(jetStart);
-    jet.lookAt(jetEnd);
-    jet.scale.set(1, 1, Math.max(0.01, jetStart.distanceTo(jetEnd)));
-  } else {
-    jet.visible = false;
-  }
-
-  updateHud(p);
-  if (sim.over && !bannerShown) showBanner();
 
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-
-// ---------- Network ----------
-const statusEl = document.querySelector<HTMLDivElement>("#status")!;
-
-async function connect(): Promise<void> {
-  try {
-    const ticket = await getWsTicket();
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws?ticket=${encodeURIComponent(ticket)}`);
-    ws.onopen = () => ws.send(JSON.stringify({ t: "ping", n: 1 }));
-    ws.onmessage = (e) => {
-      const m: ServerMsg = JSON.parse(e.data);
-      if (m.t === "welcome") statusEl.textContent = `connected (server ${m.tickHz} Hz)`;
-    };
-    ws.onclose = () => (statusEl.textContent = "disconnected");
-    ws.onerror = () => (statusEl.textContent = "connection error");
-  } catch {
-    statusEl.textContent = "connection error";
-  }
-}
-void connect();

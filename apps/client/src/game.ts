@@ -34,6 +34,7 @@ import { Predictor } from "./net/predict";
 import { createForeground } from "./foreground";
 import { bugFlyingGeo, bugFloatingGeo, bugMat, makeFish, makeFishSkin } from "./models";
 import { createWater } from "./water";
+import { audio } from "./audio";
 
 // ---------- Renderer & orthographic camera ----------
 const canvas = document.querySelector<HTMLCanvasElement>("#game")!;
@@ -152,6 +153,8 @@ const lastAim = { yaw: 0, pitch: 0 };
 let spitReadyAt = 0; // performance.now() time at which the local spit is off cooldown
 const localJets: number[] = []; // times of locally drawn jets whose server event has not arrived yet
 const rippled = new Set<number>(); // bugs that have already made a splash ring
+const ate = new Set<number>(); // bugs whose eat sound has played
+const nipTicks: number[] = []; // server ticks of nip events not yet reached on screen
 const swim = [0, 1, 2, 3].map(() => ({ x: 0, z: 0, sp: 0, phase: 0, wake: 0, init: false }));
 
 // ---------- Input ----------
@@ -239,6 +242,8 @@ function beginMatch(s: MatchState) {
   spitReadyAt = 0;
   localJets.length = 0;
   rippled.clear();
+  ate.clear();
+  nipTicks.length = 0;
   for (const w of swim) w.init = false;
 
   obstacles = generateObstacles(seed);
@@ -268,6 +273,7 @@ let lastPhase = match.state.phase;
 function onMatchState() {
   const s = match.state;
   if (s.phase === "playing" && lastPhase !== "playing") beginMatch(s);
+  if (s.phase === "ended" && lastPhase !== "ended") audio.play("end");
   if (s.phase !== "playing") {
     active = false;
     hud.style.display = "none";
@@ -290,6 +296,8 @@ function ingest(e: WireEvent) {
   } else if (e.type === "eat") {
     const h = hits.get(e.bugId);
     if (h) h.eatTime = t;
+  } else if (e.type === "nip") {
+    nipTicks.push(e.tick);
   }
 }
 
@@ -370,6 +378,7 @@ function sendTick() {
       if (nowMs >= spitReadyAt) {
         spitReadyAt = nowMs + SPIT_COOLDOWN * 1000;
         localJets.push(nowMs);
+        audio.play("spit");
         const p = Math.min(SPIT_PITCH_MAX, Math.max(SPIT_PITCH_MIN, pitch));
         const cp = Math.cos(p);
         jetStart[you]!.set(pr.body.x, SPIT_ORIGIN_Y, pr.body.z);
@@ -428,6 +437,10 @@ function updateBugs(t: number, tb: number) {
     if (h && t >= h.fall.hitTime) {
       const phase = fallingBugPhase(h.fall, t);
       if (t >= h.eatTime || phase === "expired") {
+        if (t >= h.eatTime && !ate.has(spec.id)) {
+          ate.add(spec.id);
+          audio.play("eat");
+        }
         m.visible = false;
         continue;
       }
@@ -435,8 +448,8 @@ function updateBugs(t: number, tb: number) {
       if (phase === "floating" && !rippled.has(spec.id)) {
         rippled.add(spec.id);
         water.addRipple(scratch.x, scratch.z, 0.9);
-      }
-      m.geometry = phase === "floating" ? bugFloatingGeo : bugFlyingGeo;
+        audio.play("splash");
+      } m.geometry = phase === "floating" ? bugFloatingGeo : bugFlyingGeo;
     } else {
       if (tb < spec.spawnTime || tb >= spec.despawnTime) {
         m.visible = false;
@@ -452,15 +465,20 @@ function updateBugs(t: number, tb: number) {
 
 /** Starts the jet of every spit whose moment has been reached on screen. */
 function runFx(t: number, now: number) {
+  while (nipTicks.length > 0 && nipTicks[0]! / TICK_HZ <= t) {
+    nipTicks.shift();
+    audio.play("nip");
+  }
   while (fx.length > 0 && fx[0]!.tick / TICK_HZ <= t) {
     const e = fx.shift()!;
     const id = e.playerId;
     const f = shown[id];
     if (!f || id >= jets.length) continue;
+    if (e.hit) audio.play("hit");
     if (id === you) {
       while (localJets.length > 0 && now - localJets[0]! > 1500) localJets.shift();
       if (localJets.length > 0) {
-        localJets.shift(); // already drawn when you clicked
+        localJets.shift(); // already drawn and heard when you clicked
         continue;
       }
     }
@@ -480,8 +498,10 @@ function runFx(t: number, now: number) {
       );
     }
     jetUntil[id] = now + 140;
+    audio.play("spit");
   }
 }
+
 
 const fmtCooldown = (t: number) => (t <= 0 ? "ready" : `${t.toFixed(1)}s`);
 let lastHud = "";

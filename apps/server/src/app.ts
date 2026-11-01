@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { registerAuthRoutes, type AuthDeps } from "./routes/auth.js";
+import { registerStatsRoutes, type CacheStore } from "./routes/stats.js";
 
 export type HealthCheck = { name: string; check: () => Promise<void> };
 
@@ -8,6 +9,7 @@ export type AppOptions = {
   logger?: boolean;
   readyTimeoutMs?: number;
   auth?: AuthDeps;
+  cache?: CacheStore;
   trustProxy?: boolean;
 };
 
@@ -22,8 +24,7 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
 }
 
 export function buildApp(opts: AppOptions = {}): FastifyInstance {
-  const { checks = [], logger = false, readyTimeoutMs = 2000, auth, trustProxy = false } = opts;
-
+  const { checks = [], logger = false, readyTimeoutMs = 2000, auth, cache, trustProxy = false } = opts;
   // 16 KB body cap: auth requests are tiny JSON, anything bigger is abuse.
   const app = Fastify({ logger, bodyLimit: 16 * 1024, trustProxy });
 
@@ -45,6 +46,7 @@ export function buildApp(opts: AppOptions = {}): FastifyInstance {
   });
 
   if (auth) registerAuthRoutes(app, auth);
+  if (auth && cache) registerStatsRoutes(app, { auth, cache });
 
   return app;
 }

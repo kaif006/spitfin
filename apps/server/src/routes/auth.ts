@@ -76,7 +76,7 @@ async function startSession(
   return { user: publicUser(user), csrfToken: csrfTokenFor(id) };
 }
 
-async function authenticate(
+export async function authenticate(
   deps: AuthDeps,
   req: FastifyRequest,
 ): Promise<{ sid: string; user: User } | null> {

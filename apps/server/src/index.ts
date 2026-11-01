@@ -6,6 +6,9 @@ import { findUserById } from "./db/users";
 import { readMigrations, runMigrations } from "./db/migrate";
 import { createRedis } from "./redis";
 import { Lobby } from "./rooms/lobby";
+import { Room } from "./rooms/room";
+import { buildMatchRecord } from "./stats/record";
+import { saveMatch } from "./stats/save";
 
 const config = loadConfig();
 const pool = createPool(config.databaseUrl);
@@ -19,10 +22,28 @@ const app = buildApp({
     { name: "redis", check: async () => { await redis.ping(); } },
   ],
   auth: { db: pool, redis, cookieSecure: config.cookieSecure },
+  cache: redis,
 });
 
-// One lobby for the whole process: matchmaking and rooms live in memory (Section 19, decision 6).
-const lobby = new Lobby({ onError: (err) => app.log.error({ err }, "lobby error") });
+
+const lobby = new Lobby({
+  onError: (err) => app.log.error({ err }, "lobby error"),
+  createRoom: (o) => {
+    const startedAt = new Date();
+    return new Room({
+      ...o,
+      onEnd: (room) => {
+        o.onEnd?.(room); // the lobby frees the players first
+        try {
+          const rec = buildMatchRecord(room.sim, room.seed, o.members.map((m) => m.userId), startedAt);
+          saveMatch(pool, rec).catch((err) => app.log.error({ err }, "saving match failed"));
+        } catch (err) {
+          app.log.error({ err }, "building match record failed");
+        }
+      },
+    });
+  },
+});
 
 const wss = attachWs(app.server, {
   tickets: redis,

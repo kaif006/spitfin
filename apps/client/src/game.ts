@@ -31,6 +31,9 @@ import { match, net } from "./net/match";
 import type { MatchState } from "./net/matchStore";
 import { angleDiff, sampleFrames, type Frame, type Shown } from "./net/snapshots";
 import { Predictor } from "./net/predict";
+import { createForeground } from "./foreground";
+import { bugFlyingGeo, bugFloatingGeo, bugMat, makeFish, makeFishSkin } from "./models";
+import { createWater } from "./water";
 
 // ---------- Renderer & orthographic camera ----------
 const canvas = document.querySelector<HTMLCanvasElement>("#game")!;
@@ -39,7 +42,7 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPrefer
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xf4e9c9);
+scene.background = new THREE.Color(0x2d5f3f);
 
 const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
 const PITCH = THREE.MathUtils.degToRad(50);
@@ -51,6 +54,8 @@ camera.position.set(
   Math.cos(YAW) * Math.cos(PITCH) * DIST,
 );
 camera.lookAt(0, 0, 0);
+const FLOOR_Y = -0.6;
+const foreground = createForeground(camera, scene, FLOOR_Y);
 
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
@@ -62,12 +67,12 @@ function resize() {
   camera.top = size / 2;
   camera.bottom = -size / 2;
   camera.updateProjectionMatrix();
+  foreground.layout();
 }
 window.addEventListener("resize", resize);
 resize();
 
 // ---------- Static scene ----------
-const FLOOR_Y = -0.6;
 scene.add(new THREE.HemisphereLight(0xffffff, 0xc9b27c, 1.2));
 
 const floor = new THREE.Mesh(
@@ -78,20 +83,12 @@ floor.position.y = FLOOR_Y;
 scene.add(floor);
 
 // Single translucent water layer (the only large alpha surface). Drawn after the opaque objects.
-const water = new THREE.Mesh(
-  new THREE.PlaneGeometry(ARENA.w + 2, ARENA.h + 2).rotateX(-Math.PI / 2),
-  new THREE.MeshBasicMaterial({ color: 0x4fb3c8, transparent: true, opacity: 0.4, depthWrite: false }),
-);
-water.renderOrder = 1;
-scene.add(water);
+const water = createWater(camera, ARENA.w + 2, ARENA.h + 2);
+scene.add(water.mesh);
 
 // ---------- Shared meshes and materials ----------
-const fishGeo = new THREE.ConeGeometry(0.5, 1.4, 6).rotateX(Math.PI / 2); // tip points +Z
 const FISH_COLORS = [0xf28f3b, 0x4f86f7, 0xe05d9c, 0x7bc74d]; // your own fish is always the first (orange)
-const fishMats = FISH_COLORS.map((c) => new THREE.MeshLambertMaterial({ color: c }));
-const bugGeo = new THREE.SphereGeometry(BUG_HIT_RADIUS, 10, 8);
-const flyingMat = new THREE.MeshLambertMaterial({ color: 0x2b2118 });
-const floatingMat = new THREE.MeshLambertMaterial({ color: 0xd6a02e });
+const fishSkins = FISH_COLORS.map((c) => makeFishSkin(c));
 const reedMat = new THREE.MeshLambertMaterial({ color: 0x5f8f3e });
 const rockMat = new THREE.MeshLambertMaterial({ color: 0x8c8c86 });
 
@@ -138,7 +135,7 @@ let frames: Frame[] = [];
 let latestArrival = 0;
 let renderT = -1;
 let fx: SpitEvent[] = [];
-let fishMeshes: THREE.Mesh[] = [];
+let fishMeshes: THREE.Object3D[] = [];
 let bugMeshes: THREE.Mesh[] = [];
 let acc = 0;
 let obstacles: Obstacle[] = [];
@@ -154,6 +151,8 @@ const shown: Shown[] = [];
 const lastAim = { yaw: 0, pitch: 0 };
 let spitReadyAt = 0; // performance.now() time at which the local spit is off cooldown
 const localJets: number[] = []; // times of locally drawn jets whose server event has not arrived yet
+const rippled = new Set<number>(); // bugs that have already made a splash ring
+const swim = [0, 1, 2, 3].map(() => ({ x: 0, z: 0, sp: 0, phase: 0, wake: 0, init: false }));
 
 // ---------- Input ----------
 const keys = new Set<string>();
@@ -239,6 +238,8 @@ function beginMatch(s: MatchState) {
   pendingNip = false;
   spitReadyAt = 0;
   localJets.length = 0;
+  rippled.clear();
+  for (const w of swim) w.init = false;
 
   obstacles = generateObstacles(seed);
   buildObstacles(obstacles);
@@ -248,7 +249,7 @@ function beginMatch(s: MatchState) {
   bugT = 0;
   fishGroup.clear();
   fishMeshes = roster.map((r) => {
-    const m = new THREE.Mesh(fishGeo, fishMats[colorIndex(r.id)]!);
+    const m = makeFish(fishSkins[colorIndex(r.id)]!.material);
     m.position.y = -0.25;
     fishGroup.add(m);
     return m;
@@ -415,7 +416,7 @@ function bugClock(lf: Frame, now: number): number {
 
 function updateBugs(t: number, tb: number) {
   while (bugMeshes.length < specs.length) {
-    const m = new THREE.Mesh(bugGeo, flyingMat);
+    const m = new THREE.Mesh(bugFlyingGeo, bugMat);
     m.visible = false;
     bugGroup.add(m);
     bugMeshes.push(m);
@@ -431,14 +432,18 @@ function updateBugs(t: number, tb: number) {
         continue;
       }
       fallingBugPosition(h.fall, t, scratch);
-      m.material = phase === "floating" ? floatingMat : flyingMat;
+      if (phase === "floating" && !rippled.has(spec.id)) {
+        rippled.add(spec.id);
+        water.addRipple(scratch.x, scratch.z, 0.9);
+      }
+      m.geometry = phase === "floating" ? bugFloatingGeo : bugFlyingGeo;
     } else {
       if (tb < spec.spawnTime || tb >= spec.despawnTime) {
         m.visible = false;
         continue;
       }
       bugPosition(spec, tb, scratch);
-      m.material = flyingMat;
+      m.geometry = bugFlyingGeo;
     }
     m.visible = true;
     m.position.set(scratch.x, scratch.y, scratch.z);
@@ -536,6 +541,22 @@ function frame(now: number) {
       const f = shown[i]!;
       const m = fishMeshes[i];
       if (!m) continue;
+      const w = swim[i]!;
+      if (!w.init) {
+        w.x = f.x;
+        w.z = f.z;
+        w.init = true;
+      }
+      const inst = Math.hypot(f.x - w.x, f.z - w.z) / Math.max(dt, 1e-3);
+      w.x = f.x;
+      w.z = f.z;
+      w.sp += (Math.min(inst, 8) - w.sp) * Math.min(1, dt * 6);
+      w.phase += dt * (4 + w.sp * 2.2);
+      fishSkins[colorIndex(i)]!.setSwim(w.phase, 0.35 + Math.min(1, w.sp / 4) * 0.65);
+      if (w.sp > 1.2 && now > w.wake) {
+        water.addRipple(f.x, f.z, 0.3);
+        w.wake = now + 300;
+      }
       m.position.x = f.x;
       m.position.z = f.z;
       if (i === you) {
@@ -564,6 +585,8 @@ function frame(now: number) {
     }
   }
 
+  foreground.update(now);
+  water.update();
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
